@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_cli.runtime_state import RUNTIME_STATE_FILENAMES
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,7 @@ _EXCLUDED_SUFFIXES = (
 )
 
 # File names to skip (runtime state that's meaningless on another machine)
-_EXCLUDED_NAMES = {
-    "gateway.pid",
-    "cron.pid",
-}
+_EXCLUDED_NAMES = set(RUNTIME_STATE_FILENAMES)
 
 # File names that ``hermes import`` must never overwrite, matched by basename so
 # they're caught for the root profile (``gateway_state.json``) and for named
@@ -113,13 +111,7 @@ _EXCLUDED_NAMES = {
 #
 # Older backups predate the backup-side exclusions, so we filter on import too
 # rather than trusting the archive's contents.
-_IMPORT_SKIP_NAMES = {
-    "gateway_state.json",
-    "gateway.pid",
-    "cron.pid",
-    "gateway.lock",
-    "processes.json",
-}
+_IMPORT_SKIP_NAMES = set(RUNTIME_STATE_FILENAMES)
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
 _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}

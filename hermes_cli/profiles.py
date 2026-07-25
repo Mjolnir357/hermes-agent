@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.runtime_state import RUNTIME_STATE_FILENAMES
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -71,11 +72,7 @@ _CLONE_SUBDIR_FILES = [
 # Runtime files stripped after --clone-all (shouldn't carry over).
 # Kept as a post-copy step rather than in the ignore filter because they
 # are created dynamically during normal use and may be absent at copy time.
-_CLONE_ALL_STRIP: list[str] = [
-    "gateway.pid",
-    "gateway_state.json",
-    "processes.json",
-]
+_CLONE_ALL_STRIP: list[str] = sorted(RUNTIME_STATE_FILENAMES)
 
 # Infrastructure artifacts excluded from --clone-all when the source is the
 # default profile (``~/.hermes``).  Named profiles never contain these
@@ -211,7 +208,7 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "state.db", "state.db-shm", "state.db-wal",
     "hermes_state.db",
     "response_store.db", "response_store.db-shm", "response_store.db-wal",
-    "gateway.pid", "gateway_state.json", "processes.json",
+    *RUNTIME_STATE_FILENAMES,
     "auth.json",            # API keys, OAuth tokens, credential pools
     ".env",                 # API keys (dotenv)
     "auth.lock", "active_profile", ".update_check",
@@ -1933,11 +1930,18 @@ def export_profile(name: str, output_path: str) -> Path:
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
         _CREDENTIAL_FILES = {"auth.json", ".env"}
+
+        def _named_export_ignore(directory: str, contents: list[str]) -> set[str]:
+            ignored = _CREDENTIAL_FILES & set(contents)
+            if Path(directory) == profile_dir:
+                ignored.update(RUNTIME_STATE_FILENAMES & set(contents))
+            return ignored
+
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=_named_export_ignore,
         )
         result = shutil.make_archive(base, "gztar", tmpdir, canon)
         return Path(result)
@@ -2077,6 +2081,12 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         if archive_root != canon:
             final_source = staging_root / canon
             extracted.rename(final_source)
+
+        # Defense in depth for archives created before runtime-state filtering
+        # existed. Only profile-root markers are volatile; a same-named file
+        # nested in user data is not treated as process state.
+        for runtime_name in RUNTIME_STATE_FILENAMES:
+            (final_source / runtime_name).unlink(missing_ok=True)
 
         shutil.move(str(final_source), str(profile_dir))
 

@@ -6,13 +6,14 @@ Covers:
   - jobs.update_job: set, clear, re-validate
   - tools.cronjob_tools.cronjob: create + update JSON round-trip, schema
     includes workdir, _format_job exposes it when set
-  - scheduler.tick(): partitions workdir jobs off the thread pool, restores
-    TERMINAL_CWD in finally, honours the env override during run_job
+  - scheduler.tick(): preserves ordered workdir dispatch
+  - scheduler.run_job: context/task-local cwd without process-global leakage
 """
 
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -48,6 +49,8 @@ class TestNormalizeWorkdir:
     def test_tilde_expands(self, tmp_path, monkeypatch):
         from cron.jobs import _normalize_workdir
         monkeypatch.setenv("HOME", str(tmp_path))
+        if os.name == "nt":
+            monkeypatch.setenv("USERPROFILE", str(tmp_path))
         result = _normalize_workdir("~")
         assert result == str(tmp_path.resolve())
 
@@ -258,9 +261,9 @@ class TestTickWorkdirPartition:
 
 class TestRunJobTerminalCwd:
     """
-    run_job sets TERMINAL_CWD + flips skip_context_files=False when workdir
-    is set, and restores the prior TERMINAL_CWD in finally — even on error.
-    We stub AIAgent so no real API call happens.
+    run_job binds a context-local cwd and task-local tool cwd when workdir is
+    set. It must never mutate the process-global TERMINAL_CWD, which is shared
+    with concurrent gateway conversations. We stub AIAgent so no API runs.
     """
 
     @staticmethod
@@ -272,15 +275,27 @@ class TestRunJobTerminalCwd:
 
         class FakeAgent:
             def __init__(self, **kwargs):
+                from agent.runtime_cwd import resolve_context_cwd
+
                 observed["skip_context_files"] = kwargs.get("skip_context_files")
                 observed["load_soul_identity"] = kwargs.get("load_soul_identity")
+                observed["session_id"] = kwargs.get("session_id")
                 observed["terminal_cwd_during_init"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
+                observed["context_cwd_during_init"] = resolve_context_cwd()
 
             def run_conversation(self, *_a, **_kw):
+                from agent.runtime_cwd import resolve_context_cwd
+                from tools.terminal_tool import resolve_task_overrides
+
                 observed["terminal_cwd_during_run"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
+                )
+                observed["context_cwd_during_run"] = resolve_context_cwd()
+                observed["turn_task_id"] = _kw.get("task_id")
+                observed["task_overrides_during_run"] = resolve_task_overrides(
+                    _kw.get("task_id")
                 )
                 return {"final_response": "done", "messages": []}
 
@@ -318,16 +333,19 @@ class TestRunJobTerminalCwd:
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
 
-    def test_workdir_sets_and_restores_terminal_cwd(
+    def test_workdir_is_context_local_and_does_not_leak_to_gateway(
         self, tmp_path, monkeypatch
     ):
         import os
         import cron.scheduler as sched
+        from agent.runtime_cwd import resolve_context_cwd
+        from tools.terminal_tool import resolve_task_overrides
 
-        # Make sure the test's TERMINAL_CWD starts at a known non-workdir value.
-        # Use monkeypatch.setenv so it's restored on teardown regardless of
-        # whatever other tests in this xdist worker have left behind.
-        monkeypatch.setenv("TERMINAL_CWD", "/original/cwd")
+        interactive_dir = tmp_path / "interactive"
+        interactive_dir.mkdir()
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(interactive_dir))
 
         observed: dict = {}
         self._install_stubs(monkeypatch, observed)
@@ -335,7 +353,7 @@ class TestRunJobTerminalCwd:
         job = {
             "id": "abc",
             "name": "wd-job",
-            "workdir": str(tmp_path),
+            "workdir": str(job_dir),
             "schedule_display": "manual",
         }
 
@@ -345,12 +363,20 @@ class TestRunJobTerminalCwd:
         # AIAgent was built with skip_context_files=False (feature ON).
         assert observed["skip_context_files"] is False
         assert observed["load_soul_identity"] is True
-        # TERMINAL_CWD was pointing at the job workdir while the agent ran.
-        assert observed["terminal_cwd_during_init"] == str(tmp_path.resolve())
-        assert observed["terminal_cwd_during_run"] == str(tmp_path.resolve())
+        # Process-global state remains owned by the interactive gateway context.
+        assert observed["terminal_cwd_during_init"] == str(interactive_dir)
+        assert observed["terminal_cwd_during_run"] == str(interactive_dir)
+        assert os.environ["TERMINAL_CWD"] == str(interactive_dir)
+        assert resolve_context_cwd() == interactive_dir
 
-        # And it was restored to the original value in finally.
-        assert os.environ["TERMINAL_CWD"] == "/original/cwd"
+        # Cron prompt discovery and tool resolution see only the job workdir.
+        assert observed["context_cwd_during_init"] == job_dir
+        assert observed["context_cwd_during_run"] == job_dir
+        assert observed["turn_task_id"] == observed["session_id"]
+        assert observed["task_overrides_during_run"]["cwd"] == str(job_dir)
+
+        # The task override is cleared when the cron run exits.
+        assert resolve_task_overrides(observed["session_id"]) == {}
 
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):
         """When workdir is absent, run_job must not touch TERMINAL_CWD at all —

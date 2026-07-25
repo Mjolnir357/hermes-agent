@@ -62,8 +62,20 @@ def _make_hermes_tree(root: Path) -> None:
     (root / "plugins" / "__pycache__").mkdir()
     (root / "plugins" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00")
 
-    # PID files (should be EXCLUDED)
+    # Machine/process runtime state (should be EXCLUDED)
     (root / "gateway.pid").write_text("12345")
+    (root / "gateway_state.json").write_text('{"gateway_state":"running"}')
+    (root / "cron.pid").write_text("23456")
+    (root / "gateway.lock").write_text("locked")
+    (root / "processes.json").write_text('{"processes":[]}')
+    for runtime_name in (
+        "gateway.pid",
+        "gateway_state.json",
+        "cron.pid",
+        "gateway.lock",
+        "processes.json",
+    ):
+        (root / "profiles" / "coder" / runtime_name).write_text("volatile")
 
     # Logs (should be included)
     (root / "logs").mkdir(exist_ok=True)
@@ -95,10 +107,17 @@ class TestShouldExclude:
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("some/module.pyc"))
 
-    def test_excludes_pid_files(self):
+    def test_excludes_runtime_state_files(self):
         from hermes_cli.backup import _should_exclude
-        assert _should_exclude(Path("gateway.pid"))
-        assert _should_exclude(Path("cron.pid"))
+        for runtime_name in (
+            "gateway.pid",
+            "gateway_state.json",
+            "cron.pid",
+            "gateway.lock",
+            "processes.json",
+        ):
+            assert _should_exclude(Path(runtime_name))
+            assert _should_exclude(Path("profiles/coder") / runtime_name)
 
     def test_excludes_checkpoints(self):
         """checkpoints/ is session-local trajectory cache — hash-keyed,
@@ -224,6 +243,16 @@ class TestBackup:
             assert "sessions/abc123.json" in names
             # Logs
             assert "logs/agent.log" in names
+            # Runtime state is machine/process scoped, including in profiles.
+            for runtime_name in (
+                "gateway.pid",
+                "gateway_state.json",
+                "cron.pid",
+                "gateway.lock",
+                "processes.json",
+            ):
+                assert runtime_name not in names
+                assert f"profiles/coder/{runtime_name}" not in names
             # Skins
             assert "skins/cyber.yaml" in names
 
@@ -1322,11 +1351,12 @@ class TestProfileRestoration:
         assert (hermes_home / "profiles" / "researcher" / "config.yaml").exists()
 
         # Wrapper scripts should be created
-        assert (wrapper_dir / "coder").exists()
-        assert (wrapper_dir / "researcher").exists()
+        wrapper_suffix = ".bat" if os.name == "nt" else ""
+        assert (wrapper_dir / f"coder{wrapper_suffix}").exists()
+        assert (wrapper_dir / f"researcher{wrapper_suffix}").exists()
 
         # Wrappers should contain the right content
-        coder_wrapper = (wrapper_dir / "coder").read_text()
+        coder_wrapper = (wrapper_dir / f"coder{wrapper_suffix}").read_text()
         assert "hermes -p coder" in coder_wrapper
 
     def test_import_skips_profile_dirs_without_config(self, tmp_path, monkeypatch):
@@ -1352,8 +1382,9 @@ class TestProfileRestoration:
         run_import(args)
 
         # Only valid profile should get a wrapper
-        assert (wrapper_dir / "valid").exists()
-        assert not (wrapper_dir / "empty").exists()
+        wrapper_suffix = ".bat" if os.name == "nt" else ""
+        assert (wrapper_dir / f"valid{wrapper_suffix}").exists()
+        assert not (wrapper_dir / f"empty{wrapper_suffix}").exists()
 
     def test_import_without_profiles_module(self, tmp_path, monkeypatch):
         """Import gracefully handles missing profiles module (fresh install)."""
@@ -2065,7 +2096,10 @@ class TestQuickSnapshotProjectsKanban:
         monkeypatch.setattr(bk, "_safe_copy_db", _spy)
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
         # The board db was copied via _safe_copy_db (not raw copy).
-        assert any(s.endswith("boards/work/kanban.db") for s in called["db"]), called["db"]
+        assert any(
+            s.replace("\\", "/").endswith("boards/work/kanban.db")
+            for s in called["db"]
+        ), called["db"]
         copy = hermes_home / "state-snapshots" / snap_id / "kanban" / "boards" / "work" / "kanban.db"
         rows = sqlite3.connect(str(copy)).execute("SELECT * FROM tasks").fetchall()
         assert rows == [("w1", "ship")]
@@ -2786,7 +2820,8 @@ class TestMemoryProviderExternalPaths:
         assert restored.exists()
         assert restored.read_text() == '{"peer":"bob"}'
         # Credential-shaped file tightened.
-        assert (restored.stat().st_mode & 0o777) == 0o600
+        if os.name != "nt":
+            assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
 

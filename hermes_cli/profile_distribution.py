@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.runtime_state import RUNTIME_STATE_FILENAMES
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +105,7 @@ USER_OWNED_EXCLUDE: frozenset = frozenset({
     "state.db", "state.db-shm", "state.db-wal",
     "hermes_state.db", "response_store.db",
     "response_store.db-shm", "response_store.db-wal",
-    "gateway.pid", "gateway_state.json", "processes.json",
+    *RUNTIME_STATE_FILENAMES,
     "auth.lock", "active_profile", ".update_check",
     "errors.log", ".hermes_history",
     # User data

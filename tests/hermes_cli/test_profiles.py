@@ -185,7 +185,8 @@ class TestCreateProfile:
             for line in content.splitlines()
         )
         mode = stat.S_IMODE(env_path.stat().st_mode)
-        assert mode == 0o600
+        if os.name != "nt":
+            assert mode == 0o600
 
     def test_seeded_env_does_not_clobber_cloned_env(self, profile_env):
         tmp_path = profile_env
@@ -264,6 +265,8 @@ class TestCreateProfile:
         # Runtime files that should be stripped
         (default_home / "gateway.pid").write_text("12345")
         (default_home / "gateway_state.json").write_text("{}")
+        (default_home / "cron.pid").write_text("23456")
+        (default_home / "gateway.lock").write_text("locked")
         (default_home / "processes.json").write_text("[]")
 
         profile_dir = create_profile("coder", clone_all=True, no_alias=True)
@@ -274,6 +277,8 @@ class TestCreateProfile:
         # Runtime files should be stripped
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()
+        assert not (profile_dir / "cron.pid").exists()
+        assert not (profile_dir / "gateway.lock").exists()
         assert not (profile_dir / "processes.json").exists()
 
     def test_clone_all_excludes_sibling_profiles_tree(self, profile_env):
@@ -525,7 +530,8 @@ class TestBackfillProfileEnvs:
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
             assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
-            assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+            if os.name != "nt":
+                assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
     def test_never_overwrites_existing_profile_env(self, profile_env):
         tmp_path = profile_env
@@ -1173,6 +1179,56 @@ class TestExportImport:
         assert Path(result).exists()
         assert tarfile.is_tarfile(str(result))
 
+    def test_named_export_excludes_all_runtime_state(self, profile_env, tmp_path):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        (profile_dir / "marker.txt").write_text("portable")
+        runtime_names = (
+            "gateway.pid",
+            "gateway_state.json",
+            "cron.pid",
+            "gateway.lock",
+            "processes.json",
+        )
+        for runtime_name in runtime_names:
+            (profile_dir / runtime_name).write_text("volatile")
+
+        archive_path = tmp_path / "coder.tar.gz"
+        export_profile("coder", str(archive_path))
+
+        with tarfile.open(archive_path, "r:gz") as tf:
+            names = set(tf.getnames())
+        assert "coder/marker.txt" in names
+        for runtime_name in runtime_names:
+            assert f"coder/{runtime_name}" not in names
+
+    def test_import_strips_runtime_state_from_legacy_archive(
+        self, profile_env, tmp_path
+    ):
+        archive_path = tmp_path / "legacy.tar.gz"
+        runtime_names = (
+            "gateway.pid",
+            "gateway_state.json",
+            "cron.pid",
+            "gateway.lock",
+            "processes.json",
+        )
+        with tarfile.open(archive_path, "w:gz") as tf:
+            entries = [("legacy/marker.txt", b"portable")]
+            entries.extend(
+                (f"legacy/{name}", b"volatile") for name in runtime_names
+            )
+            for member_name, data in entries:
+                info = tarfile.TarInfo(member_name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+        imported = import_profile(str(archive_path), name="restored")
+
+        assert (imported / "marker.txt").read_text() == "portable"
+        for runtime_name in runtime_names:
+            assert not (imported / runtime_name).exists()
+
     def test_import_restores_from_archive(self, profile_env, tmp_path):
         # Create and export a profile
         create_profile("coder", no_alias=True)
@@ -1334,7 +1390,8 @@ class TestExportImport:
             (sub / "marker.txt").write_text("excluded")
 
         for f in ("state.db", "gateway.pid", "gateway_state.json",
-                  "processes.json", "errors.log", ".hermes_history",
+                  "cron.pid", "gateway.lock", "processes.json",
+                  "errors.log", ".hermes_history",
                   "active_profile", ".update_check", "auth.lock"):
             (default_dir / f).write_text("excluded")
 
@@ -1360,7 +1417,8 @@ class TestExportImport:
 
         excluded_files = [
             "default/state.db", "default/gateway.pid",
-            "default/gateway_state.json", "default/processes.json",
+            "default/gateway_state.json", "default/cron.pid",
+            "default/gateway.lock", "default/processes.json",
             "default/errors.log", "default/.hermes_history",
             "default/active_profile", "default/.update_check",
             "default/auth.lock",
@@ -1436,7 +1494,10 @@ class TestExportImport:
         # following and crashing.
         broken_dir = default_dir / "skills" / "with-broken-links"
         broken_dir.mkdir(parents=True)
-        (broken_dir / "broken_link").symlink_to("/nonexistent/path")
+        try:
+            (broken_dir / "broken_link").symlink_to("/nonexistent/path")
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
         # Valid symlink for comparison
         (broken_dir / "valid_target.txt").write_text("real data")
         (broken_dir / "valid_link").symlink_to(

@@ -607,6 +607,22 @@ DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
+    # Native PowerShell command strings arrive without a powershell.exe/pwsh
+    # wrapper when Hermes is already running inside PowerShell. Anchor them at
+    # a real command position so prose and path components do not trigger.
+    (
+        rf'{_CMDPOS}(?:remove-item|rmdir|erase|del|rd|ri)\b',
+        "native PowerShell destructive delete",
+    ),
+    (
+        rf'{_CMDPOS}(?:invoke-webrequest|iwr)\b[^\n]*\|\s*'
+        rf'(?:invoke-expression|iex)\b',
+        "PowerShell download and execute",
+    ),
+    (
+        rf'{_CMDPOS}format-volume\b',
+        "PowerShell volume format",
+    ),
     # Windows shell front-ends have destructive built-ins that do not look like
     # Unix `rm`. Gate only when they are executed through cmd/powershell so
     # ordinary prose or filenames containing "del"/"rd" do not trip the guard.

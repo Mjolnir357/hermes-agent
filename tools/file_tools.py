@@ -441,37 +441,37 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    normalized = os.path.normpath(_expand_tilde(path))
-    if normalized in _BLOCKED_DEVICE_PATHS:
-        return True
-    # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
-    if normalized.startswith("/proc/") and normalized.endswith(
-        ("/fd/0", "/fd/1", "/fd/2")
-    ):
-        return True
-    # /proc/*/environ, /proc/*/cmdline, /proc/*/maps (and the maps variants
-    # smaps, smaps_rollup, numa_maps) can leak secrets, command-line args, and
-    # memory layout (ASLR bypass) from the host process (issue #4427).
-    # /proc/*/mem exposes raw process memory; block it as defense-in-depth even
-    # though it requires address knowledge to exploit usefully.
-    # /proc/*/auxv leaks AT_RANDOM (stack canary seed) plus AT_BASE/AT_PHDR
-    # load addresses — an ASLR oracle on par with maps. /proc/*/pagemap exposes
-    # virtual->physical translation. Both are blocked alongside the maps family.
-    # endswith matches both /proc/<pid>/X and /proc/<pid>/task/<tid>/X.
-    if normalized.startswith("/proc/") and normalized.endswith(
-        (
-            "/environ",
-            "/cmdline",
-            "/maps",
-            "/smaps",
-            "/smaps_rollup",
-            "/numa_maps",
-            "/mem",
-            "/auxv",
-            "/pagemap",
-        )
-    ):
-        return True
+    expanded = _expand_tilde(path)
+    # Preserve literal POSIX spelling before native normalization. On Windows,
+    # ntpath.normpath("/dev/zero") becomes "\\dev\\zero", which previously
+    # erased the guard. Do not translate backslashes here: C:\dev\zero is an
+    # ordinary Windows filesystem path and must remain usable.
+    candidates = (posixpath.normpath(expanded), os.path.normpath(expanded))
+    for normalized in candidates:
+        if normalized in _BLOCKED_DEVICE_PATHS:
+            return True
+        # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
+        if normalized.startswith("/proc/") and normalized.endswith(
+            ("/fd/0", "/fd/1", "/fd/2")
+        ):
+            return True
+        # /proc/*/environ, /proc/*/cmdline, /proc/*/maps (and variants) can
+        # leak secrets, command-line args, or memory layout. endswith also
+        # covers /proc/<pid>/task/<tid>/<file>.
+        if normalized.startswith("/proc/") and normalized.endswith(
+            (
+                "/environ",
+                "/cmdline",
+                "/maps",
+                "/smaps",
+                "/smaps_rollup",
+                "/numa_maps",
+                "/mem",
+                "/auxv",
+                "/pagemap",
+            )
+        ):
+            return True
     return False
 
 
@@ -483,6 +483,8 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     the final resolved path so aliases to devices cannot bypass the guard.
     """
     expanded = _expand_tilde(filepath)
+    if _is_blocked_device_path(expanded):
+        return True
     if base_dir is not None and not os.path.isabs(expanded):
         expanded = os.path.join(os.fspath(base_dir), expanded)
     normalized = os.path.normpath(expanded)

@@ -435,67 +435,10 @@ def _consume_interrupted_flag(job_id: str) -> bool:
         return False
 
 
-# Sequential (env-mutating) cron jobs — workdir jobs that touch
-# process-global runtime state — must run one at a time, but must NOT block the
-# ticker thread.  A persistent single-thread executor preserves ordering across
-# ticks while keeping dispatch fire-and-forget, the same as the parallel pool.
+# Keep workdir jobs ordered without blocking the ticker thread. The persistent
+# single-thread executor preserves the scheduler's established submission
+# semantics even though cwd state is now task/context local.
 _sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
-
-
-class _ReadWriteLock:
-    """Writer-preferring readers-writer lock.
-
-    Guards the process-global ``os.environ["TERMINAL_CWD"]`` override that a
-    workdir cron job applies for the whole of its agent run.  Workdir jobs are
-    writers: they mutate the shared env and need exclusive access.  Workdir-less
-    jobs are readers: they only observe ``TERMINAL_CWD`` (indirectly, via the
-    terminal / file / code-exec tools), so any number of them may run
-    concurrently with each other, but none may run alongside a writer — that is
-    exactly what stops a workdir-less job from picking up another job's workdir
-    override and running its commands in the wrong directory.
-
-    Writer preference bounds the wait for a workdir job (dispatched on the
-    single-thread sequential pool) so a stream of workdir-less readers cannot
-    starve it.
-    """
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
-        self._readers = 0
-        self._writer_active = False
-        self._writers_waiting = 0
-
-    def acquire_read(self) -> None:
-        with self._cond:
-            while self._writer_active or self._writers_waiting > 0:
-                self._cond.wait()
-            self._readers += 1
-
-    def release_read(self) -> None:
-        with self._cond:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    def acquire_write(self) -> None:
-        with self._cond:
-            self._writers_waiting += 1
-            try:
-                while self._writer_active or self._readers > 0:
-                    self._cond.wait()
-            finally:
-                self._writers_waiting -= 1
-            self._writer_active = True
-
-    def release_write(self) -> None:
-        with self._cond:
-            self._writer_active = False
-            self._cond.notify_all()
-
-
-# Serializes the per-job TERMINAL_CWD override against every other concurrently
-# running cron job.  See _ReadWriteLock and run_job for the usage contract.
-_terminal_cwd_lock = _ReadWriteLock()
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -3091,46 +3034,20 @@ def run_job(
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
-    # Per-job working directory — _SESSION_CWD was already set via
-    # set_session_vars(cwd=...) above. Here we only handle the
-    # process-global TERMINAL_CWD env var, which is serialized by
-    # _terminal_cwd_lock to avoid leaking into concurrent jobs.
-    #
-    # os.environ["TERMINAL_CWD"] is process-global, so this override is
-    # serialized by _terminal_cwd_lock (acquired just below): a workdir job
-    # holds it as a writer for its whole run, excluding every other job, while
-    # workdir-less jobs hold it as readers and stay parallel with each other.
-    # The sequential pool only keeps workdir jobs from overlapping EACH OTHER;
-    # the lock is what additionally keeps a concurrently-firing workdir-less
-    # parallel-pool job from observing this override and running its shell /
-    # file / code-exec commands in the wrong directory.  For workdir-less jobs
-    # we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    #
-    # The critical path (resolve_context_cwd / build_context_files_prompt)
-    # checks _SESSION_CWD first, so gateway sessions with no override see
-    # their own cwd, not the cron's workdir (#69396).
-
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
-
-    _holds_cwd_write = _job_workdir is not None
-    if _holds_cwd_write:
-        _terminal_cwd_lock.acquire_write()
-    else:
-        _terminal_cwd_lock.acquire_read()
-
-    # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
+    # set_session_vars(cwd=...) above already binds prompt discovery to this
+    # job's ContextVar. Bind the same directory to the task-local terminal,
+    # file, and code-exec override without mutating process-global
+    # TERMINAL_CWD, which is shared with concurrent gateway conversations.
+    _cwd_task_registered = False
     try:
         if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
+            from tools.terminal_tool import register_task_env_overrides
+
+            register_task_env_overrides(
+                _cron_session_id,
+                {"cwd": _job_workdir},
+            )
+            _cwd_task_registered = True
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -3544,7 +3461,12 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            task_id=_cron_session_id,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -3723,20 +3645,17 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Release the cwd lock now that the env is restored, so a waiting
-        # workdir job (or queued reader) can proceed without seeing the override.
-        if _holds_cwd_write:
-            _terminal_cwd_lock.release_write()
-        else:
-            _terminal_cwd_lock.release_read()
+        if _cwd_task_registered:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(_cron_session_id)
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to clear task cwd override",
+                    job_id,
+                    exc_info=True,
+                )
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
@@ -4127,12 +4046,9 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
+        # Preserve established ordering for workdir jobs on the single-thread
+        # pool. Their cwd state is task/context local, so parallel workdir-less
+        # jobs cannot observe it.
         sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
         parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 

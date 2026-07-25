@@ -2766,10 +2766,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, **kwargs):
             from tools.env_passthrough import get_all_passthrough
 
             assert "NOTION_API_KEY" in get_all_passthrough()
+            assert kwargs["task_id"].startswith("cron_skill-env-job_")
             return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -2824,12 +2825,13 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, **kwargs):
             from tools.credential_files import _get_registered
 
             registered = _get_registered()
             assert registered, "credential files must be visible in worker thread"
             assert any("google_token.json" in v for v in registered.values())
+            assert kwargs["task_id"].startswith("cron_cred-env-job_")
             return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \

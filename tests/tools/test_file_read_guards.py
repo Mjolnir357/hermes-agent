@@ -8,6 +8,7 @@ Run with:  python -m pytest tests/tools/test_file_read_guards.py -v
 """
 
 import json
+import ntpath
 import os
 import tempfile
 import time
@@ -140,7 +141,26 @@ class TestDevicePathBlocking(unittest.TestCase):
         self.assertFalse(_is_blocked_device("/tmp/test.py"))
         self.assertFalse(_is_blocked_device("/home/user/.bashrc"))
 
+    def test_windows_normalization_preserves_posix_guard(self):
+        """Native Windows normalization must not erase literal /dev and /proc."""
+        from tools.file_tools import _is_blocked_device_path
+
+        with patch("tools.file_tools.os.path", ntpath):
+            for path in (
+                "/dev/zero",
+                "/dev/stdin",
+                "/proc/self/environ",
+            ):
+                self.assertTrue(
+                    _is_blocked_device_path(path),
+                    f"{path} should be blocked before Windows normalization",
+                )
+            # This is an ordinary Windows filesystem path, not a POSIX device.
+            self.assertFalse(_is_blocked_device_path(r"C:\dev\zero"))
+
     def test_symlink_to_blocked_device_is_blocked(self):
+        if os.name == "nt":
+            self.skipTest("Windows resolves /dev/zero as an ordinary drive path")
         with tempfile.TemporaryDirectory() as tmpdir:
             link_path = os.path.join(tmpdir, "zero-link")
             try:
@@ -180,6 +200,8 @@ class TestDevicePathBlocking(unittest.TestCase):
 
     @patch("tools.file_tools._get_file_ops")
     def test_read_file_tool_rejects_device_symlink_before_io(self, mock_ops):
+        if os.name == "nt":
+            self.skipTest("Windows resolves /dev/zero as an ordinary drive path")
         with tempfile.TemporaryDirectory() as tmpdir:
             link_path = os.path.join(tmpdir, "zero-link")
             try:
